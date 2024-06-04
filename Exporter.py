@@ -10,9 +10,13 @@ import re
 from collections import defaultdict
 import itertools
 import json
+import csv
 
 log_file = None
 log_fh = None
+current_project = None
+current_project_folder = None
+file_map = {}
 
 handlers = []
 # map from presentation of `project/folder` shown in UI to (project id, folder id)
@@ -21,7 +25,7 @@ handlers = []
 project_folders_d = {} # {f'{project.name}/{folder.name}': (project.id, folder.id)}
 
 def log(*args):
-    print(*args, file=log_fh)
+    print(args, file=log_fh)
     log_fh.flush()
 
 def init_directory(name):
@@ -32,7 +36,23 @@ def init_directory(name):
 def init_logging(directory):
     global log_file, log_fh
     log_file = directory / '{:%Y_%m_%d_%H_%M}.txt'.format(datetime.now())
-    log_fh = open(log_file, 'w')
+    log_fh = open(log_file, 'w', encoding='utf-8')
+
+def init_csv(filename):
+    with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['fusion', 'repo'])
+
+def write_csv(filename, data):
+    with open(filename, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([data, ''])
+
+def read_csv(filename):
+    global file_map
+    with open(filename, 'r', newline='', encoding='utf-8') as csvfile:
+        reader = csv.DictReader(csvfile, delimiter=',')
+        file_map = [row for row in reader] # {row_index : row for row_index , row in enumerate(reader)}
 
 class Format(Enum):
     F3D = 'f3d'
@@ -45,7 +65,7 @@ class Format(Enum):
 
 FormatFromName = {x.value: x for x in Format}
 
-DEFAULT_SELECTED_FORMATS = {Format.F3D, Format.STEP}
+DEFAULT_SELECTED_FORMATS = {Format.STEP}
 
 class Ctx(NamedTuple):
     app: adsk.core.Application
@@ -55,6 +75,9 @@ class Ctx(NamedTuple):
     unhide_all: bool
     save_sketches: bool
     num_versions: int # -1 means all versions
+    keyword: str
+    use_map: bool
+    generate_template: bool
 
     def extend(self, other):
         return self._replace(folder=self.folder / other)
@@ -165,8 +188,11 @@ def sanitize_filename(name: str) -> str:
 
 def export_filename(ctx: Ctx, format: Format, file):
     sanitized = sanitize_filename(file.name)
-    name = f'{sanitized}_v{file.versionNumber}.{format.value}'
-    return ctx.folder / name
+    if ctx.num_versions == 0:
+        name = f'{sanitized}.{format.value}'
+    else:
+        name = f'{sanitized}_v{file.versionNumber}.{format.value}'
+    return name
 
 def export_sketches(ctx, component):
     counter = Counter()
@@ -191,7 +217,28 @@ def export_sketches(ctx, component):
     return counter
 
 def export_file(ctx: Ctx, format: Format, file, doc: LazyDocument) -> Counter:
-    output_path = export_filename(ctx, format, file)
+    global file_map
+    output_path = ctx.folder / export_filename(ctx, format, file)
+
+    design_path = file.parentFolder.name + '/' + file.name
+    test_list = [
+        {'Course': "C++", 'Author': "Jerry"},
+        {'Course': "Python", 'Author': "Mark"},
+        {'Course': "Java", 'Author': "Paul"}]
+    if ctx.generate_template:
+        write_csv(current_project_folder / f'{current_project}_template.csv', design_path)
+    if ctx.use_map:
+        read_csv(current_project_folder / f'{current_project}_map.csv')
+        res = next((sub for sub in file_map if sub['fusion'] == design_path), None)
+        if res:
+            output_path = current_project_folder / f'{res["repo"]}.{format.value}'
+            log(f'{design_path} map exists {res["repo"]}')
+
+
+        output_path_s= str(output_path)
+
+    output_path.parent.mkdir(exist_ok=True, parents=True)
+
     if output_path.exists():
         log(f'{output_path} already exists, skipping')
         return Counter(skipped=1)
@@ -203,13 +250,11 @@ def export_file(ctx: Ctx, format: Format, file, doc: LazyDocument) -> Counter:
     design = doc.design
     em = design.exportManager
 
-    output_path.parent.mkdir(exist_ok=True, parents=True)
-    output_path_s = str(output_path)
-
     if format == Format.F3D:
         options = em.createFusionArchiveExportOptions(output_path_s)
     elif format == Format.STL:
         options = em.createSTLExportOptions(design.rootComponent, output_path_s)
+        options.meshRefinement = 0
     elif format == Format.TMF:
         options = em.createC3MFExportOptions(design.rootComponent, output_path_s)
     elif format == Format.STEP:
@@ -230,10 +275,14 @@ def export_file(ctx: Ctx, format: Format, file, doc: LazyDocument) -> Counter:
     return Counter(saved=1)
 
 def visit_file(ctx: Ctx, file) -> Counter:
-    log(f'Visiting file {file.name} v{file.versionNumber} . {file.fileExtension}')
+    log(f'Visiting file {file.name} v{file.versionNumber}.{file.fileExtension}')
 
     if file.fileExtension != 'f3d':
         log(f'file {file.name} has extension {file.fileExtension} which is not currently handled, skipping')
+        return Counter(skipped=1)
+    
+    if not(ctx.keyword.lower() in file.name.lower()):
+        log(f'file {file.name} does have {ctx.keyword}, skipping')
         return Counter(skipped=1)
 
     doc = LazyDocument(ctx, file)
@@ -265,6 +314,7 @@ def file_versions(file, num_versions):
     yield file
     prev = file.versionNumber
     for v in versions:
+        log(f'file {file.name} has {v.versionNumber}')
         if prev - v.versionNumber != 1:
             raise Exception(f'Versions not contiguous! prev={prev} cur={v.versionNumber}')
         yield v
@@ -292,8 +342,11 @@ def visit_folder(ctx: Ctx, folder, recurse=True) -> Counter:
     return counter
 
 def main(ctx: Ctx) -> Counter:
+    global current_project
+    global current_project_folder
     init_directory(ctx.folder)
     init_logging(ctx.folder)
+
 
     log(ctx.dumps())
 
@@ -301,6 +354,11 @@ def main(ctx: Ctx) -> Counter:
 
     for project_id, folder_ids in ctx.projects_folders.items():
         project = ctx.app.data.dataProjects.itemById(project_id)
+        current_project = project.name
+        current_project_folder = ctx.folder
+        if ctx.generate_template:
+            init_csv(current_project_folder / f'{current_project}_template.csv')
+        log(f'Visiting project {project.name}')
 
         if folder_ids == []:  # empty filter visit everything
             counter += visit_folder(ctx, project.rootFolder)
@@ -379,6 +437,9 @@ class ExporterCommandCreatedEventHandler(adsk.core.CommandCreatedEventHandler):
             populate_data_projects_list(drop)
 
             inputs.addBoolValueInput('unhide_all', 'Unhide All Bodies', True, '', True)
+            inputs.addStringValueInput('keyword', 'Keyword', "")
+            inputs.addBoolValueInput('generate_template', 'Generate Template CSV <project_template>.csv', True, '', False)
+            inputs.addBoolValueInput('use_map', 'Use Map CSV <project_map>.csv', True, '', False)
             versions_group = inputs.addGroupCommandInput('group_versions', 'Versions')
             versions_group.children.addIntegerSpinnerCommandInput('version_count', 'Number of Previous Versions', 0, 2**16-1, 1, 0)
             versions_group.children.addBoolValueInput('all_versions', 'Save ALL Versions', True, '', False)
@@ -440,8 +501,11 @@ class ExporterCommandExecuteHandler(adsk.core.CommandEventHandler):
                 formats = [FormatFromName[x] for x in selected(inputs.itemById('file_types').listItems)],
                 projects_folders = make_projects_folders(inputs),
                 unhide_all = inputs.itemById('unhide_all').value,
+                keyword = inputs.itemById('keyword').value,
                 save_sketches = inputs.itemById('save_sketches').value,
                 num_versions = -1 if inputs.itemById('all_versions').value else inputs.itemById('version_count').value,
+                use_map = inputs.itemById('use_map').value,
+                generate_template = inputs.itemById('generate_template').value,
             )
             run_main(ctx)
         except:
