@@ -227,13 +227,14 @@ def export_file(ctx: Ctx, format: Format, file, doc: LazyDocument) -> Counter:
         {'Course': "Java", 'Author': "Paul"}]
     if ctx.generate_template:
         write_csv(current_project_folder / f'{current_project}_template.csv', design_path)
+        return Counter(skipped=1)
+    
     if ctx.use_map:
         read_csv(current_project_folder / f'{current_project}_map.csv')
         res = next((sub for sub in file_map if sub['fusion'] == design_path), None)
         if res:
             output_path = current_project_folder / f'{res["repo"]}.{format.value}'
             log(f'{design_path} map exists {res["repo"]}')
-
 
         output_path_s= str(output_path)
 
@@ -437,8 +438,8 @@ class ExporterCommandCreatedEventHandler(adsk.core.CommandCreatedEventHandler):
             populate_data_projects_list(drop)
 
             inputs.addBoolValueInput('unhide_all', 'Unhide All Bodies', True, '', True)
-            inputs.addStringValueInput('keyword', 'Keyword', "")
-            inputs.addBoolValueInput('generate_template', 'Generate Template CSV <project_template>.csv', True, '', False)
+            inputs.addStringValueInput('keyword', 'Keyword Filter', "")
+            inputs.addBoolValueInput('generate_template', 'Generate Template CSV <project_template>.csv (will not export models)', True, '', False)
             inputs.addBoolValueInput('use_map', 'Use Map CSV <project_map>.csv', True, '', False)
             versions_group = inputs.addGroupCommandInput('group_versions', 'Versions')
             versions_group.children.addIntegerSpinnerCommandInput('version_count', 'Number of Previous Versions', 0, 2**16-1, 1, 0)
@@ -474,11 +475,16 @@ def run_main(ctx):
         app = adsk.core.Application.get()
         ui = app.userInterface
         counter = main(ctx)
+        if ctx.generate_template:
+            template = f'{current_project}_template.csv created'
+        else:
+            template = ''
         ui.messageBox('\n'.join((
             f'Saved {counter.saved} files',
             f'Skipped {counter.skipped} files',
             f'Encountered {counter.errored} errors',
-            f'Log file is at {log_file}'
+            f'Log file is at {log_file}',
+            template
         )))
 
     except:
